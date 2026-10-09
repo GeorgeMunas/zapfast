@@ -1,6 +1,6 @@
 ---
 title: Using ZapFast
-description: Send messages and use attachments, interactive messages, voice messages, and keyboard shortcuts.
+description: Send messages, open chats from links, and use attachments, interactive messages, voice messages, and keyboard shortcuts.
 redirect_from:
   - /using-fastsapp/
 nav_order: 3
@@ -20,6 +20,9 @@ Right-click a message to reply, react with any emoji, edit, forward, delete, or
 check when it was sent, delivered, and read. The reaction row has a **+** that
 opens the full emoji picker. Hover over a reaction to see who added it.
 Editing uses the composer. Press Escape to cancel.
+
+**Development builds** also show when your message was delivered and read when
+you click its time or ticks, as on WhatsApp.
 
 Double-click beside a message, or on its edge, to reply to it. A double-click
 on its text still selects the word.
@@ -50,6 +53,26 @@ original version was never stored on this computer. Keep your phone online.
 Availability depends on what the phone sends; messages deleted for you stay
 deleted. This action does not require unlinking your account or clearing the
 archive.
+
+## Selecting messages
+
+Choose **Select messages** in the chat's menu (the three dots at the top),
+**Select** in a message's menu, or Ctrl-click (Command-click on macOS) a
+message. As in WhatsApp Web, every message then gets a check box on the left.
+Click anywhere on a message's row, its box included, to add or remove it.
+Shift-click adds every message up to the one you click, and a drag adds every
+message it passes, scrolling when you hold the pointer at the top or bottom
+edge. A drag that starts beside the bubbles, off the text, starts a selection
+too. A drag over the text outside a selection still selects the text to copy.
+**Forward…** sends the selected messages together, in their original
+order. Unticking the last message keeps the selection open; Escape or the
+close button ends it. A batch goes out one message at a time, each starting
+once the one before it reached WhatsApp, so a picture cannot overtake the
+text that came before it. Deleted or unsupported messages, phone-only content,
+polls, and interactive messages cannot be selected or forwarded, so they have
+no box. If a selected message is deleted, it leaves the selection automatically.
+Keyboard focus outlines the box; screen readers identify its message
+by sender, time, and a short summary.
 
 ## Stickers
 
@@ -115,7 +138,9 @@ downloads are on, or on click. Visible stickers download automatically even
 when that setting is off. The 64 MiB limit applies to both automatic and manual
 downloads, including videos and stickers; clicking a larger attachment does
 not bypass it. If an attachment has expired, ZapFast asks your phone to upload
-it again.
+it again. A live-location share shows the position this linked device received;
+WhatsApp sends later positions only to the phone. ZapFast marks when newer
+positions are available there, but cannot follow the moving location here.
 
 ## Interactive messages
 
@@ -219,6 +244,12 @@ Click a downloaded photo to preview it, with zoom (wheel, Ctrl+wheel, or a
 pinch) and **Copy image**. **Save as…** in a downloaded attachment's
 right-click menu keeps a copy wherever you choose.
 
+A motion photo has a play button in its corner. Click it to download the short
+clip to the local cache and play it over the photo, muted and in a loop; click
+again to return to the photo. In the photo's preview, the play button in the
+header plays the clip over the whole window with sound. The clip follows the
+same download limit.
+
 ## Polls
 
 Choose **Create poll** from the plus menu beside the message field to ask a
@@ -243,8 +274,9 @@ Starting a reply before recording includes the quoted message.
 
 ## Copying
 
-Select and copy any message text. A selection across messages uses WhatsApp's
-sharing format:
+Select and copy any message text. You can begin dragging in the padding around
+the text instead of landing precisely on a letter. A selection across messages
+uses WhatsApp's sharing format:
 
 ```
 [18:21, 8/30/2026] Ada Lovelace: Hello from France!
@@ -286,7 +318,8 @@ eight hours, one week, or indefinitely. These changes also apply on your
 phone. **Delete chat** in the same menu and **Clear chat** in the chat
 header's menu need a connection: the phone acts first, and the chat leaves
 this computer once it confirms. Groups and channels can be left from the same
-menu, keeping their history here.
+menu, keeping their history here. `Ctrl+E` (Command+E on macOS) archives the
+open chat, or unarchives it from **Archived**, as in WhatsApp.
 
 Archived chats stay archived when new messages arrive. **Development builds**
 add **Keep chats archived** in Settings: turn it off to have a new message,
@@ -302,6 +335,37 @@ Click the chat header to see its picture, number, and group members. When
 WhatsApp lets you edit a group's info, rename it with the pencil beside its
 name and click its photo to change it. Clicking a `chat.whatsapp.com` invite
 link shows the group and joins it without leaving ZapFast.
+
+## Links
+
+ZapFast registers the `whatsapp:` and `wa:` schemes, so a link that names a
+chat opens that chat here. This works from a terminal, a script, or anything
+else that hands a link to the desktop.
+
+```sh
+xdg-open 'whatsapp://send?phone=20123456789'
+zapfast 'https://wa.me/20123456789?text=Invoice%20%23123%20is%20attached'
+zapfast +20123456789
+```
+
+A number on its own, a `wa.me` or `api.whatsapp.com` link, and the
+`whatsapp://send?phone=` URI all name the same chat. A `text=` template, which
+most shared links carry, lands in the composer without being sent, so you can
+edit it or add to it before sending. The composer keeps whatever you were
+already typing, and a chat with unsent text of your own keeps it: a template
+never replaces a draft you wrote.
+
+When ZapFast is already running the link brings its window forward on that
+chat rather than starting a second copy, and when it is not it starts and
+opens the chat. While the app lock is up the link waits for the unlock rather
+than opening anything the lock hides.
+
+A `https://wa.me/...` link opened in a browser still opens WhatsApp Web: the
+desktop decides what a web link means, and a browser cannot be told to hand
+one link to another app. Use the `whatsapp:` form, or `zapfast`, for that.
+
+An unreadable argument opens nothing and says so, rather than opening a chat
+it guessed at.
 
 ## Locked chats
 
@@ -351,7 +415,9 @@ taskbar button while the window is open, using `99+` above 99. Windows must use
 its regular taskbar icon size for overlays to appear. The count
 does not count toasts remaining in Windows notification history. On Linux and
 Windows, notifications show the chat picture and open the chat at the message
-they announced when clicked. Muted chats do not send notifications, and
+they announced when clicked. On Linux, a notification that arrives while the
+window is open behind others also highlights ZapFast in the taskbar until you
+switch to it. Muted chats do not send notifications, and
 archived chats stay quiet while they remain archived. You can change both settings.
 
 Press `Ctrl+/` or click the keyboard button under the composer to list all

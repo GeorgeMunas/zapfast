@@ -54,6 +54,15 @@ pub struct Archive {
 
 pub type Result<T> = std::result::Result<T, rusqlite::Error>;
 
+/// Marks an archived photo whose clip is known as a motion photo. Only the
+/// photo's own sender can give it a clip.
+const MARK_MOTION: &str = "UPDATE messages SET content = json_set(content, '$.motion', json('{}'))
+    WHERE chat = ?1 AND id = ?2 AND json_valid(content)
+      AND json_extract(content, '$.kind') = 'image'
+      AND json_extract(content, '$.motion') IS NULL
+      AND EXISTS (SELECT 1 FROM motion_clips c
+                  WHERE c.chat = ?1 AND c.parent = ?2 AND c.sender = messages.sender)";
+
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS chats (
     id TEXT PRIMARY KEY,
@@ -82,6 +91,16 @@ CREATE TABLE IF NOT EXISTS messages (
     PRIMARY KEY (chat, id)
 );
 CREATE INDEX IF NOT EXISTS messages_by_time ON messages (chat, timestamp);
+CREATE TABLE IF NOT EXISTS motion_clips (
+    chat TEXT NOT NULL,
+    parent TEXT NOT NULL,
+    sender TEXT NOT NULL,
+    raw BLOB NOT NULL,
+    PRIMARY KEY (chat, parent, sender)
+);
+CREATE TRIGGER IF NOT EXISTS delete_motion_clips AFTER DELETE ON messages BEGIN
+    DELETE FROM motion_clips WHERE chat = OLD.chat AND parent = OLD.id;
+END;
 CREATE INDEX IF NOT EXISTS messages_stickers ON messages (from_me, timestamp)
     WHERE json_extract(content, '$.kind') = 'sticker';
 CREATE TABLE IF NOT EXISTS contacts (
@@ -865,6 +884,68 @@ impl Archive {
         Ok(Some(message))
     }
 
+    /// Keeps the download keys of a motion photo's clip and marks its photo.
+    /// Returns whether an archived photo changed.
+    pub fn put_motion_clip(
+        &self,
+        chat: &str,
+        parent: &str,
+        sender: &str,
+        raw: &[u8],
+    ) -> Result<bool> {
+        if self.message_removed(chat, parent)? {
+            return Ok(false);
+        }
+        self.connection.execute(
+            "INSERT OR REPLACE INTO motion_clips (chat, parent, sender, raw) VALUES (?1, ?2, ?3, ?4)",
+            params![chat, parent, sender, raw],
+        )?;
+        Ok(self
+            .connection
+            .execute(MARK_MOTION, params![chat, parent])?
+            > 0)
+    }
+
+    /// The raw video message of a motion photo's clip, from the photo's sender.
+    pub fn motion_clip(&self, chat: &str, parent: &str) -> Result<Option<Vec<u8>>> {
+        self.connection
+            .query_row(
+                "SELECT c.raw FROM motion_clips c
+                 JOIN messages m ON m.chat = c.chat AND m.id = c.parent AND m.sender = c.sender
+                 WHERE c.chat = ?1 AND c.parent = ?2",
+                params![chat, parent],
+                |row| row.get(0),
+            )
+            .optional()
+    }
+
+    pub fn put_motion_path(&self, chat: &str, id: &str, path: Option<&Path>) -> Result<()> {
+        let Some(mut message) = self.message(chat, id)? else {
+            return Ok(());
+        };
+        if let Content::Image { motion, .. } = &mut message.content {
+            motion.get_or_insert_default().path = path.map(Path::to_path_buf);
+            self.set_content(chat, id, &message.content, message.edited)?;
+        }
+        Ok(())
+    }
+
+    /// Returns all recorded motion clip paths.
+    pub fn motion_paths(&self) -> Result<Vec<(String, String, PathBuf)>> {
+        let mut statement = self.connection.prepare(
+            "SELECT chat, id, json_extract(content, '$.motion.path') AS path
+             FROM messages WHERE path IS NOT NULL",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                PathBuf::from(row.get::<_, String>(2)?),
+            ))
+        })?;
+        rows.collect()
+    }
+
     /// Returns all recorded attachment paths.
     pub fn media_paths(&self) -> Result<Vec<(String, String, std::path::PathBuf)>> {
         let mut statement = self.connection.prepare(
@@ -900,21 +981,14 @@ impl Archive {
         rows.collect()
     }
 
-    /// Stores a privacy id mapping and carries early mute/pin/lock sync and
-    /// the favorite mark to the canonical chat. Returns whether that chat's
-    /// preferences were touched.
+    /// Stores a privacy id mapping and reconciles history already filed under
+    /// the privacy id with the canonical phone-number chat.
     pub fn put_lid(&self, lid: &str, pn: &str) -> Result<bool> {
         let transaction = self.connection.unchecked_transaction()?;
-        Self::merge_group_recipient(
-            &transaction,
-            &format!("{lid}@lid"),
-            &format!("{pn}@s.whatsapp.net"),
-        )?;
-        let favorite = Self::move_favorite(
-            &transaction,
-            &format!("{lid}@lid"),
-            &format!("{pn}@s.whatsapp.net"),
-        )?;
+        let lid_chat = format!("{lid}@lid");
+        let phone_chat = format!("{pn}@s.whatsapp.net");
+        Self::merge_group_recipient(&transaction, &lid_chat, &phone_chat)?;
+        let favorite = Self::move_favorite(&transaction, &lid_chat, &phone_chat)?;
         self.connection.execute(
             "INSERT INTO lids (lid, pn) VALUES (?1, ?2) ON CONFLICT(lid) DO UPDATE SET pn = excluded.pn",
             params![lid, pn],
@@ -922,39 +996,117 @@ impl Archive {
         self.connection.execute(
             "INSERT INTO chat_removals (chat, through) SELECT ?2, through FROM chat_removals WHERE chat = ?1
              ON CONFLICT(chat) DO UPDATE SET through = MAX(through, excluded.through)",
-            params![format!("{lid}@lid"), format!("{pn}@s.whatsapp.net")])?;
+            params![lid_chat, phone_chat])?;
         self.connection.execute(
             "INSERT INTO message_removals (account, chat, id)
              SELECT account, chat, id FROM pending_message_removals WHERE confirmed = 1 AND chat IN (?1, ?2)
              AND account = (SELECT value FROM meta WHERE key = 'me_pn')
              ON CONFLICT(chat, id) DO UPDATE SET account = excluded.account",
-            params![format!("{lid}@lid"), format!("{pn}@s.whatsapp.net")],
+            params![lid_chat, phone_chat],
         )?;
         self.connection.execute(
             "INSERT INTO message_removals (account, chat, id)
              SELECT account, ?2, id FROM message_removals WHERE chat = ?1
              AND account = COALESCE((SELECT value FROM meta WHERE key = 'me_pn'), '')
              ON CONFLICT(chat, id) DO UPDATE SET account = excluded.account",
-            params![format!("{lid}@lid"), format!("{pn}@s.whatsapp.net")],
+            params![lid_chat, phone_chat],
         )?;
         self.connection.execute(
             "INSERT INTO message_removals (account, chat, id)
              SELECT account, ?1, id FROM message_removals WHERE chat = ?2
              AND account = COALESCE((SELECT value FROM meta WHERE key = 'me_pn'), '')
              ON CONFLICT(chat, id) DO UPDATE SET account = excluded.account",
-            params![format!("{lid}@lid"), format!("{pn}@s.whatsapp.net")],
+            params![lid_chat, phone_chat],
+        )?;
+        self.connection.execute(
+            "INSERT INTO pending_message_removals (account, chat, id, confirmed)
+             SELECT account, ?2, id, confirmed FROM pending_message_removals WHERE chat = ?1
+             ON CONFLICT(chat, id) DO UPDATE SET
+                confirmed = CASE WHEN pending_message_removals.account = excluded.account
+                    THEN MAX(pending_message_removals.confirmed, excluded.confirmed) ELSE 0 END,
+                account = excluded.account",
+            params![lid_chat, phone_chat],
+        )?;
+        self.connection.execute(
+            "DELETE FROM pending_message_removals WHERE chat = ?1",
+            params![lid_chat],
         )?;
         let removed = self.connection.execute(
             "DELETE FROM messages WHERE chat IN (?1, ?2) AND id IN
              (SELECT id FROM message_removals WHERE chat = ?1
                 AND account = COALESCE((SELECT value FROM meta WHERE key = 'me_pn'), ''))",
-            params![format!("{pn}@s.whatsapp.net"), format!("{lid}@lid")],
+            params![phone_chat, lid_chat],
         )?;
         self.connection.execute(
             "DELETE FROM pending_message_removals WHERE chat IN (?1, ?2) AND id IN
              (SELECT id FROM message_removals WHERE chat = ?1
                 AND account = COALESCE((SELECT value FROM meta WHERE key = 'me_pn'), ''))",
-            params![format!("{pn}@s.whatsapp.net"), format!("{lid}@lid")],
+            params![phone_chat, lid_chat],
+        )?;
+        // Mapping can arrive after messages were synced under the LID. Keep
+        // those messages and chat-scoped state reachable through the PN chat.
+        let had_lid_chat: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM chats WHERE id = ?1)",
+            params![lid_chat],
+            |row| row.get(0),
+        )?;
+        transaction.execute(
+            "INSERT OR IGNORE INTO chats (id, name, kind, last_activity, unread, archived, pinned, muted_until, pinned_at, group_subject_known)
+             SELECT ?2, name, kind, last_activity, unread, archived, pinned, muted_until, pinned_at, group_subject_known
+             FROM chats WHERE id = ?1",
+            params![lid_chat, phone_chat],
+        )?;
+        transaction.execute(
+            "INSERT INTO messages (chat, id, sender, sender_name, from_me, timestamp, content, status, quoted, reactions, edited, raw, thumbnail, mentions, forwarded, delivered_at, read_at, history_order)
+             SELECT ?2, id, sender, sender_name, from_me, timestamp, content, status, quoted, reactions, edited, raw, thumbnail, mentions, forwarded, delivered_at, read_at, history_order
+             FROM messages WHERE chat = ?1 AND timestamp > COALESCE(
+                (SELECT through FROM chat_removals WHERE chat = ?2), -1)
+             ON CONFLICT(chat, id) DO UPDATE SET
+                content = CASE WHEN excluded.edited > messages.edited THEN excluded.content ELSE messages.content END,
+                sender_name = COALESCE(messages.sender_name, excluded.sender_name),
+                status = MAX(messages.status, excluded.status),
+                quoted = COALESCE(messages.quoted, excluded.quoted),
+                reactions = CASE WHEN messages.reactions = '[]' THEN excluded.reactions ELSE messages.reactions END,
+                edited = MAX(messages.edited, excluded.edited),
+                raw = COALESCE(messages.raw, excluded.raw),
+                thumbnail = COALESCE(messages.thumbnail, excluded.thumbnail),
+                mentions = CASE WHEN excluded.edited > messages.edited OR messages.mentions = '[]'
+                    THEN excluded.mentions ELSE messages.mentions END,
+                forwarded = MAX(messages.forwarded, excluded.forwarded),
+                delivered_at = COALESCE(messages.delivered_at, excluded.delivered_at),
+                read_at = COALESCE(messages.read_at, excluded.read_at),
+                history_order = COALESCE(messages.history_order, excluded.history_order)",
+            params![lid_chat, phone_chat],
+        )?;
+        transaction.execute(
+            "INSERT OR IGNORE INTO polls (chat, id, creator, secret) SELECT ?2, id, creator, secret FROM polls WHERE chat = ?1",
+            params![lid_chat, phone_chat],
+        )?;
+        transaction.execute(
+            "INSERT OR IGNORE INTO poll_history (chat, id) SELECT ?2, id FROM poll_history WHERE chat = ?1",
+            params![lid_chat, phone_chat],
+        )?;
+        transaction.execute(
+            "INSERT INTO poll_votes (chat, poll, voter, sender, update_id, at, from_me, choices, encrypted, attempted)
+             SELECT ?2, poll, voter, sender, update_id, at, from_me, choices, encrypted, attempted FROM poll_votes WHERE chat = ?1
+             ON CONFLICT(chat, poll, voter) DO UPDATE SET
+                sender = excluded.sender, update_id = excluded.update_id, at = excluded.at,
+                from_me = excluded.from_me, choices = excluded.choices,
+                encrypted = excluded.encrypted, attempted = excluded.attempted
+             WHERE (excluded.at, excluded.update_id) > (poll_votes.at, poll_votes.update_id)
+                OR ((excluded.at, excluded.update_id) = (poll_votes.at, poll_votes.update_id)
+                    AND poll_votes.choices IS NULL AND excluded.choices IS NOT NULL)",
+            params![lid_chat, phone_chat],
+        )?;
+        transaction.execute(
+            "INSERT OR IGNORE INTO local_chat_labels (chat, label) SELECT ?2, label FROM local_chat_labels WHERE chat = ?1",
+            params![lid_chat, phone_chat],
+        )?;
+        transaction.execute(
+            "INSERT INTO drafts (chat, text, updated_at) SELECT ?2, text, updated_at FROM drafts WHERE chat = ?1
+             ON CONFLICT(chat) DO UPDATE SET text = excluded.text, updated_at = excluded.updated_at
+             WHERE excluded.updated_at > drafts.updated_at",
+            params![lid_chat, phone_chat],
         )?;
         let changed = self.connection.execute(
             "INSERT INTO chats (id, name, kind, pinned, pinned_at, pin_updated_at,
@@ -981,10 +1133,40 @@ impl Archive {
                 archived = CASE WHEN excluded.archive_updated_at >= COALESCE(archive_updated_at, -1)
                     THEN excluded.archived ELSE archived END,
                 archive_updated_at = NULLIF(MAX(COALESCE(archive_updated_at, -1), COALESCE(excluded.archive_updated_at, -1)), -1)",
-            params![format!("{lid}@lid"), format!("{pn}@s.whatsapp.net"), pn],
+            params![lid_chat, phone_chat, pn],
         )?;
+        transaction.execute(
+            "UPDATE chats SET
+                name = CASE WHEN name = '' OR name = ?2 THEN (SELECT name FROM chats WHERE id = ?1) ELSE name END,
+                last_activity = MAX(last_activity, (SELECT last_activity FROM chats WHERE id = ?1)),
+                unread = MAX(unread, (SELECT unread FROM chats WHERE id = ?1)),
+                read_through = CASE WHEN read_through IS NULL THEN (SELECT read_through FROM chats WHERE id = ?1)
+                    WHEN (SELECT read_through FROM chats WHERE id = ?1) IS NULL THEN read_through
+                    ELSE MAX(read_through, (SELECT read_through FROM chats WHERE id = ?1)) END,
+                pending_read = CASE WHEN pending_read IS NULL THEN (SELECT pending_read FROM chats WHERE id = ?1)
+                    WHEN (SELECT pending_read FROM chats WHERE id = ?1) IS NULL THEN pending_read
+                    ELSE MAX(pending_read, (SELECT pending_read FROM chats WHERE id = ?1)) END,
+                marked_unread = MAX(marked_unread, COALESCE((SELECT marked_unread FROM chats WHERE id = ?1), 0)),
+                pending_unread = CASE WHEN pending_unread IS NULL THEN (SELECT pending_unread FROM chats WHERE id = ?1)
+                    WHEN (SELECT pending_unread FROM chats WHERE id = ?1) IS NULL THEN pending_unread
+                    ELSE MAX(pending_unread, (SELECT pending_unread FROM chats WHERE id = ?1)) END,
+                ephemeral_expiration = CASE
+                    WHEN (SELECT ephemeral_setting_timestamp FROM chats WHERE id = ?1) IS NOT NULL
+                        AND (ephemeral_setting_timestamp IS NULL OR (SELECT ephemeral_setting_timestamp FROM chats WHERE id = ?1) >= ephemeral_setting_timestamp)
+                    THEN (SELECT ephemeral_expiration FROM chats WHERE id = ?1)
+                    ELSE ephemeral_expiration END,
+                ephemeral_setting_timestamp = CASE WHEN ephemeral_setting_timestamp IS NULL THEN (SELECT ephemeral_setting_timestamp FROM chats WHERE id = ?1)
+                    WHEN (SELECT ephemeral_setting_timestamp FROM chats WHERE id = ?1) IS NULL THEN ephemeral_setting_timestamp
+                    ELSE MAX(ephemeral_setting_timestamp, (SELECT ephemeral_setting_timestamp FROM chats WHERE id = ?1)) END,
+                notification_sound = COALESCE(notification_sound, (SELECT notification_sound FROM chats WHERE id = ?1)),
+                history_start = MAX(history_start, COALESCE((SELECT history_start FROM chats WHERE id = ?1), 0))
+             WHERE id = ?4 AND EXISTS(SELECT 1 FROM chats WHERE id = ?1)",
+            params![lid_chat, pn, phone_chat, phone_chat],
+        )?;
+        self.purge_chat_rows(&lid_chat)?;
+        transaction.execute("DELETE FROM chats WHERE id = ?1", params![lid_chat])?;
         transaction.commit()?;
-        Ok(changed > 0 || favorite || removed > 0)
+        Ok(changed > 0 || favorite || removed > 0 || had_lid_chat)
     }
 
     pub fn lids(&self) -> Result<Vec<(String, String)>> {
@@ -1054,6 +1236,10 @@ impl Archive {
                 message.history_order,
             ],
         )?;
+        if matches!(message.content, Content::Image { motion: None, .. }) {
+            self.connection
+                .execute(MARK_MOTION, params![message.chat, message.id])?;
+        }
         self.connection.execute(
             "UPDATE chats SET last_activity = MAX(last_activity, ?2) WHERE id = ?1",
             params![message.chat, message.timestamp],
@@ -1340,6 +1526,17 @@ impl Archive {
         rows.collect()
     }
 
+    /// Messages filed as unsupported without a named kind, with their raw protobuf.
+    pub fn unsupported_with_raw(&self) -> Result<Vec<(String, String, Vec<u8>)>> {
+        let mut statement = self.connection.prepare(
+            "SELECT chat, id, raw FROM messages WHERE raw IS NOT NULL AND json_valid(content)
+             AND json_extract(content, '$.kind') = 'unsupported'
+             AND json_extract(content, '$.what') = 'message'",
+        )?;
+        let rows = statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
+        rows.collect()
+    }
+
     /// Interactive messages eligible for a derived presentation upgrade.
     /// Deleted and edited rows are left intact; callers preserve local media paths.
     pub fn interactive_placeholders(&self) -> Result<Vec<(String, String, Vec<u8>)>> {
@@ -1576,6 +1773,7 @@ impl Archive {
     fn purge_chat_rows(&self, chat: &str) -> Result<()> {
         for table in [
             "messages",
+            "motion_clips",
             "group_receipts",
             "polls",
             "poll_history",
@@ -1606,6 +1804,8 @@ impl Archive {
                  UNION ALL
                  SELECT json_extract(m.content, '$.card.image.path') FROM messages m WHERE {filter}
                  UNION ALL
+                 SELECT json_extract(m.content, '$.motion.path') FROM messages m WHERE {filter}
+                 UNION ALL
                  SELECT json_extract(c.value, '$.image.path')
                  FROM messages m, json_each(m.content, '$.card.carousel') c WHERE {filter}
              ) WHERE file IS NOT NULL"
@@ -1633,6 +1833,26 @@ impl Archive {
                 |row| row.get(0),
             )
             .optional()
+    }
+
+    /// The id of `sender`'s only live location in `chat` since `since`.
+    /// Returns `None` when more than one share could match an unreferenced update.
+    pub fn unique_live_location(
+        &self,
+        chat: &str,
+        sender: &str,
+        since: i64,
+    ) -> Result<Option<String>> {
+        let mut statement = self.connection.prepare(
+            "SELECT id FROM messages
+             WHERE chat = ?1 AND timestamp >= ?3 AND sender = ?2
+               AND json_extract(content, '$.kind') = 'livelocation'
+             ORDER BY timestamp DESC LIMIT 2",
+        )?;
+        let mut ids = statement
+            .query_map(params![chat, sender, since], |row| row.get(0))?
+            .collect::<Result<Vec<String>>>()?;
+        Ok((ids.len() == 1).then(|| ids.remove(0)))
     }
 
     /// The id of `sender`'s newest message in `chat`.
@@ -1928,7 +2148,7 @@ impl Archive {
     /// Clears all archived data during unlinking.
     pub fn clear(&self) -> Result<()> {
         self.connection.execute_batch(
-            "DELETE FROM poll_history; DELETE FROM poll_votes; DELETE FROM polls; DELETE FROM group_receipts; DELETE FROM messages; DELETE FROM chats; DELETE FROM chat_removals; DELETE FROM message_removals; DELETE FROM pending_message_removals; DELETE FROM contacts; DELETE FROM meta; DELETE FROM lids; DELETE FROM drafts; DELETE FROM local_chat_labels; DELETE FROM local_labels; DELETE FROM removed_recent_stickers; DELETE FROM favorite_stickers; DELETE FROM favorites; DELETE FROM favorite_changes;",
+            "DELETE FROM poll_history; DELETE FROM poll_votes; DELETE FROM polls; DELETE FROM group_receipts; DELETE FROM messages; DELETE FROM motion_clips; DELETE FROM chats; DELETE FROM chat_removals; DELETE FROM message_removals; DELETE FROM pending_message_removals; DELETE FROM contacts; DELETE FROM meta; DELETE FROM lids; DELETE FROM drafts; DELETE FROM local_chat_labels; DELETE FROM local_labels; DELETE FROM removed_recent_stickers; DELETE FROM favorite_stickers; DELETE FROM favorites; DELETE FROM favorite_changes;",
         )
     }
 }
@@ -2409,6 +2629,7 @@ pub(crate) mod tests {
                 sequence,
                 ended,
                 updated: 0,
+                newer_on_phone: false,
             };
             row.thumbnail = thumbnail;
             row
@@ -2442,6 +2663,7 @@ pub(crate) mod tests {
                 sequence: 2,
                 ended: false,
                 updated: 0,
+                newer_on_phone: false,
             }
         );
         assert_eq!(updated.thumbnail, Some(vec![1, 2, 3]));
@@ -2650,6 +2872,74 @@ pub(crate) mod tests {
     /// downloaded image, a poll with its history and a vote, and a group
     /// receipt. The builder checks each table, so a missing row cannot let a
     /// broken purge pass.
+    #[test]
+    fn only_the_sender_of_a_photo_gives_it_a_motion_clip() {
+        let archive = Archive::in_memory().expect("archive");
+        let chat = "group@g.us";
+        archive.ensure_chat(chat, "Group").expect("chat");
+        let mut photo = message(chat, "photo", 100, false);
+        photo.sender = "alice@s.whatsapp.net".into();
+        photo.content = Content::Image {
+            motion: None,
+            caption: None,
+            media: crate::model::Media {
+                mime: "image/jpeg".into(),
+                size: 1,
+                width: None,
+                height: None,
+                path: None,
+                state: crate::model::MediaState::Idle,
+            },
+        };
+        archive.insert_message(&photo, None).expect("insert");
+        let marked = |archive: &Archive| {
+            matches!(
+                archive.message(chat, "photo").unwrap().unwrap().content,
+                Content::Image {
+                    motion: Some(_),
+                    ..
+                }
+            )
+        };
+        assert!(
+            !archive
+                .put_motion_clip(chat, "photo", "mallory@s.whatsapp.net", b"theirs")
+                .unwrap()
+        );
+        assert!(!marked(&archive));
+        assert_eq!(archive.motion_clip(chat, "photo").unwrap(), None);
+        assert!(
+            archive
+                .put_motion_clip(chat, "photo", "alice@s.whatsapp.net", b"hers")
+                .unwrap()
+        );
+        assert!(marked(&archive));
+        assert_eq!(
+            archive.motion_clip(chat, "photo").unwrap().as_deref(),
+            Some(&b"hers"[..])
+        );
+        // A clip that came first marks its photo when the photo is filed, and
+        // leaves with it.
+        archive
+            .put_motion_clip(chat, "later", "alice@s.whatsapp.net", b"early")
+            .unwrap();
+        photo.id = "later".into();
+        archive.insert_message(&photo, None).expect("insert");
+        assert!(matches!(
+            archive.message(chat, "later").unwrap().unwrap().content,
+            Content::Image {
+                motion: Some(_),
+                ..
+            }
+        ));
+        archive.delete_message(chat, "later").expect("delete");
+        let left: i64 = archive
+            .connection
+            .query_row("SELECT COUNT(*) FROM motion_clips", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(left, 2);
+    }
+
     fn furnished_chat(archive: &Archive, chat: &str, media: &Path) -> String {
         archive.ensure_chat(chat, "Somebody").expect("chat");
         archive
@@ -2657,6 +2947,7 @@ pub(crate) mod tests {
             .expect("insert");
         let mut image = message(chat, "m2", 200, false);
         image.content = Content::Image {
+            motion: None,
             caption: None,
             media: crate::model::Media {
                 mime: "image/jpeg".into(),
@@ -2671,6 +2962,10 @@ pub(crate) mod tests {
         archive
             .set_media_path(chat, "m2", media)
             .expect("media path");
+        // No photo: the trigger on messages cannot remove this clip.
+        archive
+            .put_motion_clip(chat, "absent", chat, b"clip")
+            .expect("motion clip");
         archive.set_unread(chat, 3).expect("unread");
         archive
             .connection
@@ -2694,8 +2989,9 @@ pub(crate) mod tests {
     }
 
     /// Every table keyed by chat besides `chats` itself.
-    const CHAT_TABLES: [&str; 7] = [
+    const CHAT_TABLES: [&str; 8] = [
         "messages",
+        "motion_clips",
         "group_receipts",
         "polls",
         "poll_history",
@@ -2904,6 +3200,111 @@ pub(crate) mod tests {
                 .messages(&chat, None, 50)
                 .expect("messages")
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn late_privacy_mapping_moves_history_into_the_phone_chat() {
+        let archive = Archive::in_memory().unwrap();
+        let lid = "9@lid";
+        let phone = "1@s.whatsapp.net";
+        archive.ensure_chat(lid, "Ada").unwrap();
+        archive.ensure_chat(phone, "1").unwrap();
+        archive
+            .insert_message(&message(lid, "from-lid", 100, false), None)
+            .unwrap();
+        archive
+            .insert_message(&message(phone, "from-phone", 200, false), None)
+            .unwrap();
+        let mut original = message(phone, "edited-on-lid", 150, false);
+        original.mentions = vec![crate::model::MentionRef {
+            user: "@phone".into(),
+            id: phone.into(),
+        }];
+        archive.insert_message(&original, None).unwrap();
+        let mut edited = message(lid, "edited-on-lid", 150, false);
+        edited.content = Content::text("edited under privacy id");
+        edited.edited = true;
+        edited.mentions = vec![crate::model::MentionRef {
+            user: "@lid".into(),
+            id: lid.into(),
+        }];
+        archive.insert_message(&edited, None).unwrap();
+        let label = archive
+            .create_label("Follow up", "#123456", 1)
+            .unwrap()
+            .unwrap();
+        archive
+            .set_chat_labels(lid, std::slice::from_ref(&label.id))
+            .unwrap();
+        archive.set_draft(lid, "unsent", 100).unwrap();
+
+        assert!(archive.put_lid("9", "1").unwrap());
+
+        let messages = archive.messages(phone, None, 50).unwrap();
+        assert_eq!(messages.len(), 3);
+        assert!(messages.iter().any(|row| row.id == "from-lid"));
+        assert!(messages.iter().any(|row| row.id == "from-phone"));
+        let edited = archive.message(phone, "edited-on-lid").unwrap().unwrap();
+        assert_eq!(edited.content, Content::text("edited under privacy id"));
+        assert_eq!(
+            edited.mentions,
+            vec![crate::model::MentionRef {
+                user: "@lid".into(),
+                id: lid.into(),
+            }]
+        );
+        assert!(archive.chat(lid).unwrap().is_none());
+        assert!(archive.messages(lid, None, 50).unwrap().is_empty());
+        assert_eq!(archive.chat_labels(phone).unwrap(), [label.id]);
+        assert_eq!(archive.drafts().unwrap(), [(phone.into(), "unsent".into())]);
+        assert_eq!(archive.read_through(phone).unwrap(), None);
+        let ephemeral_timestamp: Option<i64> = archive
+            .connection
+            .query_row(
+                "SELECT ephemeral_setting_timestamp FROM chats WHERE id = ?1",
+                params![phone],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(ephemeral_timestamp, None);
+    }
+
+    #[test]
+    fn late_privacy_mapping_respects_phone_chat_removal_and_moves_pending_deletions() {
+        let archive = Archive::in_memory().unwrap();
+        let lid = "9@lid";
+        let phone = "1@s.whatsapp.net";
+        archive.ensure_chat(lid, "Ada").unwrap();
+        archive.ensure_chat(phone, "1").unwrap();
+        archive
+            .insert_message(&message(phone, "cleared", 100, false), None)
+            .unwrap();
+        archive.remove_chat_through(phone, 100, false).unwrap();
+        archive
+            .insert_message(&message(lid, "old-lid-copy", 100, false), None)
+            .unwrap();
+        archive
+            .insert_message(&message(lid, "new-lid-copy", 200, false), None)
+            .unwrap();
+        archive
+            .queue_message_removal("account", lid, "new-lid-copy")
+            .unwrap();
+
+        archive.put_lid("9", "1").unwrap();
+
+        assert_eq!(
+            archive
+                .messages(phone, None, 50)
+                .unwrap()
+                .iter()
+                .map(|message| message.id.as_str())
+                .collect::<Vec<_>>(),
+            ["new-lid-copy"]
+        );
+        assert_eq!(
+            archive.pending_message_removals("account").unwrap(),
+            [(phone.into(), "new-lid-copy".into())]
         );
     }
 
@@ -3772,6 +4173,7 @@ pub(crate) mod tests {
         archive.ensure_chat(chat, "A").expect("chat");
         let mut picture = message(chat, "p1", 100, false);
         picture.content = Content::Image {
+            motion: None,
             caption: None,
             media: crate::model::Media {
                 mime: "image/jpeg".into(),
@@ -4001,6 +4403,7 @@ mod media_path_tests {
             from_me: false,
             timestamp: 1,
             content: Content::Image {
+                motion: None,
                 media: Media {
                     mime: "image/jpeg".into(),
                     size: 10,
